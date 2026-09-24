@@ -14,6 +14,10 @@
 原样、左右镜像、正反互换或两者组合地读出）与按相同拼版规则生成的预期印张配对，先最大化配对数、
 再最大化已读页位吻合数，并逐张给出帖号/张号、解释变换与已知页位错误明细。
 
+还提供**上机拼版**接口 `/api/v1/impose/press-layout`：在相同的总页数/每帖最大张数/装订方向
+拼版规则上，按帖号、张号给出纸面尺寸，以及正反面每个页位的页码、左上角坐标与旋转角度
+（支持长边 `long` / 短边 `short` 双面翻转）。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件），在项目根目录执行：
@@ -54,6 +58,7 @@ HOST_PORT=9000 docker compose up -d --build
 - 章节分帖拼版接口：`POST http://localhost:8000/api/v1/impose/chapters`
 - 重印复用接口：`POST http://localhost:8000/api/v1/impose/reprint`
 - 印张抽检接口：`POST http://localhost:8000/api/v1/impose/inspect`
+- 上机拼版接口：`POST http://localhost:8000/api/v1/impose/press-layout`
 
 ## 接口说明
 
@@ -444,6 +449,127 @@ curl -X POST http://localhost:8000/api/v1/impose/inspect \
 `page_ids` 或 `observed_sheets` 为空、页面 ID 为空字符串/重复/为 `"?"`，
 或实物页位为空字符串时，均返回 `422 Unprocessable Entity`。
 （页位缺字段或类型错误同样返回 422；空白页须显式传 `null`，未读出传 `"?"`。）
+
+## 上机拼版（POST /api/v1/impose/press-layout）
+
+在 `/api/v1/impose` 的页码拼版结果上附加**纸面几何信息**，供直接上机印刷：按帖号、张号给出
+每张纸的纸面尺寸，以及正反面每个页位的页码、左上角坐标与旋转角度。分帖、末帖补空白与
+左/右装订页序完全沿用 `/api/v1/impose`。本地访问地址
+`http://localhost:8000/api/v1/impose/press-layout`（改了 `HOST_PORT` 则对应替换端口）。
+
+### 请求
+
+`POST /api/v1/impose/press-layout`，`Content-Type: application/json`
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `total_pages` | 整数 | ≥ 1 | 总页数（正整数） |
+| `max_sheets_per_signature` | 整数 | ≥ 1 | 每帖最多纸张数；每帖最多容纳其 **4 倍**页数 |
+| `binding` | 字符串 | `left` / `right` | 装订方向：左装订 / 右装订 |
+| `page_width_mm` | 数值 | > 0，有限值 | 单页宽度（毫米） |
+| `page_height_mm` | 数值 | > 0，有限值 | 单页高度（毫米） |
+| `gutter_mm` | 数值 | ≥ 0，有限值 | 两页之间的中缝宽度（毫米），可为 0 |
+| `duplex_flip` | 字符串 | `long` / `short` | 双面翻转方式：长边翻页 / 短边翻页 |
+
+```bash
+curl -X POST http://localhost:8000/api/v1/impose/press-layout \
+  -H "Content-Type: application/json" \
+  -d '{
+    "total_pages": 4,
+    "max_sheets_per_signature": 2,
+    "binding": "left",
+    "page_width_mm": 210,
+    "page_height_mm": 297,
+    "gutter_mm": 0,
+    "duplex_flip": "long"
+  }'
+```
+
+### 响应
+
+- 每张纸给出纸面尺寸：`paper_width_mm`（宽 = **2 × 单页宽 + 中缝**）、
+  `paper_height_mm`（高 = **单页高**）；
+- 正面 `front` / 背面 `back` 各含左 `left` / 右 `right` 两个页位；每个页位给出：
+  - `page`：页码（空白页为 `null`，**整个页位对象为 `null`**）；
+  - `x_mm` / `y_mm`：页位左上角相对**纸面左上角**原点的坐标（毫米，y 轴向下）；
+  - `rotation`：绕**页位中心**的旋转角度，仅为 `0` 或 `180`。
+- 页位坐标规则：
+  - **正面**：左右槽依次位于 `x = 0` 与 `x = page_width_mm + gutter_mm`，均旋转 `0°`；
+  - **背面 long（长边翻页）**：**交换左右槽**的页码（左槽放原右页、右槽放原左页），
+    旋转 `0°`，槽位坐标不变；
+  - **背面 short（短边翻页）**：**保持槽位**，两槽各旋转 `180°`（绕页位中心），
+    槽位坐标不变。
+
+上例（4 页、A4 竖版、无中缝、`long`）最外张：正面 `4 / 1`，背面页序为 `2 / 3`，
+长边翻页后左右槽交换：
+
+```json
+{
+  "total_pages": 4,
+  "max_sheets_per_signature": 2,
+  "binding": "left",
+  "page_width_mm": 210.0,
+  "page_height_mm": 297.0,
+  "gutter_mm": 0.0,
+  "duplex_flip": "long",
+  "signature_count": 1,
+  "signatures": [
+    {
+      "signature_index": 1,
+      "sheet_count": 1,
+      "page_count_padded": 4,
+      "sheets": [
+        {
+          "sheet_index": 1,
+          "paper_width_mm": 420.0,
+          "paper_height_mm": 297.0,
+          "front": {
+            "left":  { "page": 4, "x_mm": 0.0,   "y_mm": 0.0, "rotation": 0 },
+            "right": { "page": 1, "x_mm": 210.0, "y_mm": 0.0, "rotation": 0 }
+          },
+          "back": {
+            "left":  { "page": 3, "x_mm": 0.0,   "y_mm": 0.0, "rotation": 0 },
+            "right": { "page": 2, "x_mm": 210.0, "y_mm": 0.0, "rotation": 0 }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+> 若 `duplex_flip` 为 `short`，上例背面将保持槽位：左槽页码 `2`（`rotation: 180`）、
+> 右槽页码 `3`（`rotation: 180`），`x_mm` 仍为 `0.0` / `210.0`。
+> 右装订（`binding: "right"`）时页序沿用现有镜像规则（正面为 `1 / 4`）。
+> 末帖补齐的空白页位整体返回 `null`。
+
+### 用 Docker Compose 启动并访问
+
+项目根目录一键启动（自动构建镜像、安装依赖并在容器内以 uvicorn 拉起服务）：
+
+```bash
+docker compose up -d --build      # 启动
+docker compose logs -f            # 查看日志
+docker compose down               # 停止
+```
+
+容器内固定监听 `8000`，默认映射到宿主机同号端口；通过环境变量 `HOST_PORT` 可改宿主机端口
+（见上文「必要配置」一节）：
+
+```bash
+HOST_PORT=9000 docker compose up -d --build
+# 此时接口地址为 http://localhost:9000/api/v1/impose/press-layout
+```
+
+默认配置下健康检查 `GET http://localhost:8000/health`，Swagger 文档
+`http://localhost:8000/docs`。
+
+### 非法参数（4xx）
+
+除与 `/api/v1/impose` 相同的校验（`total_pages` / `max_sheets_per_signature` ≥ 1、
+`binding` 合法、未定义字段等）外，`page_width_mm` / `page_height_mm` 不为正数（含 0、负数、
+`NaN`、`Infinity`），`gutter_mm` 为负数或非有限值，或 `duplex_flip` 不是 `long`/`short` 时，
+均返回 `422 Unprocessable Entity`。
 
 ## 本地开发（不使用 Docker）
 

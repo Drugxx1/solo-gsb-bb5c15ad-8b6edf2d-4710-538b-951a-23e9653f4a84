@@ -1,13 +1,14 @@
 """离线小册子拼版 API。"""
 from __future__ import annotations
 
+import math
 from typing import Literal, Optional
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
-from .imposition import impose, impose_chapters, inspect_observed_sheets, plan_reprint, UNREAD
+from .imposition import impose, impose_chapters, inspect_observed_sheets, plan_reprint, press_layout, UNREAD
 
 app = FastAPI(
     title="离线小册子拼版 API",
@@ -19,8 +20,9 @@ app = FastAPI(
         "支持旧版/新版重印复用：四页位完全相同且均未改动的旧印张可整张复用。"
         "支持印张抽检：把乱序实物印张（可原样/左右镜像/正反互换/两者组合解释）"
         "与预期拼版配对并核对已知页位。"
+        "支持上机拼版：在页码拼版结果上给出纸面尺寸、各页位左上角坐标与旋转角度。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -62,6 +64,88 @@ class ImpositionResponse(BaseModel):
     binding: Literal["left", "right"]
     signature_count: int
     signatures: list[Signature]
+
+
+# ---------------------------------------------------------------------------
+# 上机拼版 /api/v1/impose/press-layout
+# ---------------------------------------------------------------------------
+
+
+class PressLayoutRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    total_pages: int = Field(
+        ..., ge=1, description="总页数，正整数（1, 2, 3, ...）"
+    )
+    max_sheets_per_signature: int = Field(
+        ..., ge=1, description="每帖最多纸张数，正整数；每帖最多容纳其 4 倍页数"
+    )
+    binding: Literal["left", "right"] = Field(
+        ..., description="装订方向：left=左装订，right=右装订"
+    )
+    page_width_mm: float = Field(..., description="单页宽度（mm），正数、有限值")
+    page_height_mm: float = Field(..., description="单页高度（mm），正数、有限值")
+    gutter_mm: float = Field(..., description="中缝宽度（mm），非负数、有限值")
+    duplex_flip: Literal["long", "short"] = Field(
+        ..., description="双面翻转方式：long=长边翻页，short=短边翻页"
+    )
+
+    @field_validator("page_width_mm", "page_height_mm")
+    @classmethod
+    def validate_positive_size(cls, value: float) -> float:
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("必须为正数且为有限值")
+        return value
+
+    @field_validator("gutter_mm")
+    @classmethod
+    def validate_non_negative_gutter(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("必须为非负数且为有限值")
+        return value
+
+
+class PressPageSlot(BaseModel):
+    page: Optional[int] = Field(..., description="页码；空白页位为 null（整个页位为 null）")
+    x_mm: float = Field(..., description="页位左上角相对纸面左上角的 x 坐标（mm）")
+    y_mm: float = Field(..., description="页位左上角相对纸面左上角的 y 坐标（mm）")
+    rotation: Literal[0, 180] = Field(
+        ..., description="绕页位中心的旋转角度（度）：0 或 180"
+    )
+
+
+class PressPagePair(BaseModel):
+    left: Optional[PressPageSlot] = Field(..., description="左页位；空白页为 null")
+    right: Optional[PressPageSlot] = Field(..., description="右页位；空白页为 null")
+
+
+class PressSheet(BaseModel):
+    sheet_index: int = Field(..., description="帖内纸张序号，从 1 开始（1 为最外张）")
+    paper_width_mm: float = Field(
+        ..., description="纸面宽度（mm）= 2 × 单页宽 + 中缝"
+    )
+    paper_height_mm: float = Field(..., description="纸面高度（mm）= 单页高")
+    front: PressPagePair = Field(..., description="正面左右页位")
+    back: PressPagePair = Field(..., description="背面左右页位")
+
+
+class PressSignature(BaseModel):
+    signature_index: int = Field(..., description="帖号，从 1 开始")
+    sheet_count: int = Field(..., description="本帖纸张数")
+    page_count_padded: int = Field(..., description="本帖补齐空白后的总页数（4 的倍数）")
+    sheets: list[PressSheet] = Field(..., description="帖内纸张，按从外到内排列")
+
+
+class PressLayoutResponse(BaseModel):
+    total_pages: int
+    max_sheets_per_signature: int
+    binding: Literal["left", "right"]
+    page_width_mm: float
+    page_height_mm: float
+    gutter_mm: float
+    duplex_flip: Literal["long", "short"]
+    signature_count: int
+    signatures: list[PressSignature]
 
 
 class ChapterImpositionRequest(BaseModel):
@@ -327,6 +411,74 @@ def create_imposition(request: ImpositionRequest) -> ImpositionResponse:
         binding=request.binding,
         signature_count=len(signatures),
         signatures=signatures,
+    )
+
+
+@app.post(
+    "/api/v1/impose/press-layout",
+    response_model=PressLayoutResponse,
+    tags=["拼版"],
+    summary="上机拼版：纸面尺寸、页位坐标与旋转角度",
+)
+def create_press_layout(request: PressLayoutRequest) -> PressLayoutResponse:
+    signatures = press_layout(
+        total_pages=request.total_pages,
+        max_sheets=request.max_sheets_per_signature,
+        binding=request.binding,
+        page_width=request.page_width_mm,
+        page_height=request.page_height_mm,
+        gutter=request.gutter_mm,
+        duplex_flip=request.duplex_flip,
+    )
+
+    def render_slot(slot: Optional[dict]) -> Optional[PressPageSlot]:
+        if slot is None:
+            return None
+        return PressPageSlot(
+            page=slot["page"],
+            x_mm=slot["x"],
+            y_mm=slot["y"],
+            rotation=slot["rotation"],
+        )
+
+    rendered_signatures = []
+    for signature in signatures:
+        rendered_sheets = []
+        for sheet in signature["sheets"]:
+            rendered_sheets.append(
+                PressSheet(
+                    sheet_index=sheet["sheet_index"],
+                    paper_width_mm=sheet["paper_width_mm"],
+                    paper_height_mm=sheet["paper_height_mm"],
+                    front=PressPagePair(
+                        left=render_slot(sheet["front"]["left"]),
+                        right=render_slot(sheet["front"]["right"]),
+                    ),
+                    back=PressPagePair(
+                        left=render_slot(sheet["back"]["left"]),
+                        right=render_slot(sheet["back"]["right"]),
+                    ),
+                )
+            )
+        rendered_signatures.append(
+            PressSignature(
+                signature_index=signature["signature_index"],
+                sheet_count=signature["sheet_count"],
+                page_count_padded=signature["page_count_padded"],
+                sheets=rendered_sheets,
+            )
+        )
+
+    return PressLayoutResponse(
+        total_pages=request.total_pages,
+        max_sheets_per_signature=request.max_sheets_per_signature,
+        binding=request.binding,
+        page_width_mm=request.page_width_mm,
+        page_height_mm=request.page_height_mm,
+        gutter_mm=request.gutter_mm,
+        duplex_flip=request.duplex_flip,
+        signature_count=len(rendered_signatures),
+        signatures=rendered_signatures,
     )
 
 

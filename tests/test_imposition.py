@@ -7,6 +7,7 @@ from app.imposition import (
     impose_signature,
     impose,
     impose_chapters,
+    press_layout,
 )
 
 
@@ -195,3 +196,87 @@ def test_impose_chapters_page_coverage_and_right_binding():
     assert sorted(seen) == list(range(1, 21))
     # 右装订镜像：首帖最外张正面 = 首页/末页
     assert result[0]["sheets"][0]["front"] == {"left": 1, "right": 4}
+
+
+# ---------------------------------------------------------------------------
+# 上机拼版 press_layout
+# ---------------------------------------------------------------------------
+
+
+def _slot(slot):
+    return None if slot is None else (slot["page"], slot["x"], slot["y"], slot["rotation"])
+
+
+def test_press_layout_paper_size_is_two_pages_plus_gutter():
+    result = press_layout(4, 1, "left", 210.0, 297.0, 8.0, "long")
+    sheet = result[0]["sheets"][0]
+    assert sheet["paper_width_mm"] == 428.0  # 2 × 210 + 8
+    assert sheet["paper_height_mm"] == 297.0
+
+
+def test_press_layout_front_slots_anchors_and_rotation():
+    # 4 页单帖最外张正面 = 4/1
+    result = press_layout(4, 1, "left", 100.0, 200.0, 10.0, "long")
+    front = result[0]["sheets"][0]["front"]
+    assert _slot(front["left"]) == (4, 0.0, 0.0, 0)
+    assert _slot(front["right"]) == (1, 110.0, 0.0, 0)  # 页宽 + 中缝
+
+
+def test_press_layout_back_long_swaps_slots_no_rotation():
+    # 左装订最外张背面页序 = 2/3；long 交换左右槽 -> 左槽 3、右槽 2，旋转 0°
+    result = press_layout(4, 1, "left", 100.0, 200.0, 10.0, "long")
+    back = result[0]["sheets"][0]["back"]
+    assert _slot(back["left"]) == (3, 0.0, 0.0, 0)
+    assert _slot(back["right"]) == (2, 110.0, 0.0, 0)
+
+
+def test_press_layout_back_short_keeps_slots_rotates_180():
+    # short 保持槽位：左槽 2、右槽 3，各旋转 180°，槽位锚点不变
+    result = press_layout(4, 1, "left", 100.0, 200.0, 10.0, "short")
+    back = result[0]["sheets"][0]["back"]
+    assert _slot(back["left"]) == (2, 0.0, 0.0, 180)
+    assert _slot(back["right"]) == (3, 110.0, 0.0, 180)
+    # 正面不受翻转方式影响
+    front = result[0]["sheets"][0]["front"]
+    assert _slot(front["left"]) == (4, 0.0, 0.0, 0)
+    assert _slot(front["right"]) == (1, 110.0, 0.0, 0)
+
+
+def test_press_layout_right_binding_page_order():
+    # 右装订最外张：正面 1/4，背面 3/2；long 交换背面槽位 -> 左槽 2、右槽 3
+    result = press_layout(4, 1, "right", 100.0, 200.0, 0.0, "long")
+    sheet = result[0]["sheets"][0]
+    assert _slot(sheet["front"]["left"]) == (1, 0.0, 0.0, 0)
+    assert _slot(sheet["front"]["right"]) == (4, 100.0, 0.0, 0)
+    assert _slot(sheet["back"]["left"]) == (2, 0.0, 0.0, 0)
+    assert _slot(sheet["back"]["right"]) == (3, 100.0, 0.0, 0)
+
+
+def test_press_layout_blank_slot_is_null():
+    # 1 页补 3 空白：正面 空白/1，背面 空白/空白
+    result = press_layout(1, 1, "left", 100.0, 200.0, 0.0, "long")
+    sheet = result[0]["sheets"][0]
+    assert sheet["front"]["left"] is None
+    assert _slot(sheet["front"]["right"]) == (1, 100.0, 0.0, 0)
+    assert sheet["back"]["left"] is None
+    assert sheet["back"]["right"] is None
+    # short 模式下空白页位同样为 null
+    result_short = press_layout(1, 1, "left", 100.0, 200.0, 0.0, "short")
+    sheet_short = result_short[0]["sheets"][0]
+    assert sheet_short["back"]["left"] is None
+    assert sheet_short["back"]["right"] is None
+
+
+def test_press_layout_gutter_zero_and_multi_signatures():
+    # 20 页、每帖 2 张 -> 3 帖（8/8/4），无中缝时右槽 x = 页宽
+    result = press_layout(20, 2, "left", 210.0, 297.0, 0.0, "short")
+    assert [s["signature_index"] for s in result] == [1, 2, 3]
+    assert [s["sheet_count"] for s in result] == [2, 2, 1]
+    for signature in result:
+        for sheet in signature["sheets"]:
+            assert sheet["paper_width_mm"] == 420.0
+            assert sheet["paper_height_mm"] == 297.0
+    # 末帖最外张正面 = 20/17，背面 short 保持槽位、旋转 180°
+    last_back = result[2]["sheets"][0]["back"]
+    assert _slot(last_back["left"]) == (18, 0.0, 0.0, 180)
+    assert _slot(last_back["right"]) == (19, 210.0, 0.0, 180)

@@ -14,6 +14,15 @@
 - 分帖边界依次最小化：各帖补至 4 的倍数所需空白总数 → 帖数；
   仍相同则优先最早的分帖边界；
 - 每帖各自在尾部补空白至 4 的倍数，再按规则 3/4 拼版。
+
+上机拼版（``press_layout``）
+----
+- 在 :func:`impose` 的页码结果上附加纸面尺寸与逐页位坐标/旋转：
+  纸面宽 ``2 * page_width + gutter``、高 ``page_height``；
+- 正面左右槽锚点依次位于 ``x = 0`` 与 ``x = page_width + gutter``，旋转 0°；
+- 双面翻转 ``long``：背面交换左右槽页码、旋转 0°；
+  ``short``：背面保持槽位、各旋转 180°（均绕页位中心）；槽位锚点不变；
+- 空白页位（``None``）整体返回 ``None``，不给出坐标。
 """
 from __future__ import annotations
 
@@ -102,6 +111,88 @@ def impose(total_pages: int, max_sheets: int, binding: Binding) -> List[dict]:
             }
         )
     return result
+
+
+# ---------------------------------------------------------------------------
+# 上机拼版（press layout）：拼版结果 + 纸面尺寸 + 页位坐标/旋转
+# ---------------------------------------------------------------------------
+
+DuplexFlip = Literal["long", "short"]
+
+
+def press_layout(
+    total_pages: int,
+    max_sheets: int,
+    binding: Binding,
+    page_width: float,
+    page_height: float,
+    gutter: float,
+    duplex_flip: DuplexFlip,
+) -> List[dict]:
+    """在 :func:`impose` 结果上附加纸面几何信息，供上机印刷使用。
+
+    纸面宽 = ``2 * page_width + gutter``、高 = ``page_height``（所有帖、张相同）。
+    坐标以纸面左上角为原点（mm，y 轴向下），两个页位槽的锚点固定：
+    左槽 ``(x=0, y=0)``、右槽 ``(x=page_width+gutter, y=0)``。
+
+    - 正面：页码按页序放入左右槽，均旋转 0°；
+    - 背面 ``long``（长边翻页）：**交换左右槽**的页码（左槽放原右页、
+      右槽放原左页），旋转 0°，槽位坐标不变；
+    - 背面 ``short``（短边翻页）：**保持槽位**，两槽各旋转 180°
+      （绕页位中心），槽位坐标不变。
+
+    页码仍沿用 :func:`impose_signature` 的左/右装订页序；空白页位（``None``）
+    整体返回 ``None``。
+    """
+    paper_width = 2 * page_width + gutter
+    slot_x = (0.0, page_width + gutter)
+
+    def slot(page: Optional[int], x: float, rotation: int) -> Optional[dict]:
+        if page is None:
+            return None
+        return {
+            "page": page,
+            "x": x,
+            "y": 0.0,
+            "rotation": rotation,
+        }
+
+    def render_side(pair: dict, is_back: bool) -> dict:
+        if is_back and duplex_flip == "long":
+            # 长边翻页：左右槽交换页码，各自旋转 0°、槽位锚点不变
+            left_page, right_page = pair["right"], pair["left"]
+            rotation = 0
+        else:
+            left_page, right_page = pair["left"], pair["right"]
+            # 短边翻页：槽位不变，两槽各旋转 180°（绕页位中心）
+            rotation = 180 if is_back else 0
+        return {
+            "left": slot(left_page, slot_x[0], rotation),
+            "right": slot(right_page, slot_x[1], rotation),
+        }
+
+    signatures: List[dict] = []
+    for imposed in impose(total_pages, max_sheets, binding):
+        sheets: List[dict] = []
+        for imposed_sheet in imposed["sheets"]:
+            sheets.append(
+                {
+                    "sheet_index": imposed_sheet["sheet_index"],
+                    "paper_width_mm": paper_width,
+                    "paper_height_mm": page_height,
+                    "front": render_side(imposed_sheet["front"], is_back=False),
+                    "back": render_side(imposed_sheet["back"], is_back=True),
+                }
+            )
+        signatures.append(
+            {
+                "signature_index": imposed["signature_index"],
+                "sheet_count": imposed["sheet_count"],
+                "page_count_padded": imposed["page_count_padded"],
+                "sheets": sheets,
+            }
+        )
+    return signatures
 
 
 def split_signatures_by_chapters(
