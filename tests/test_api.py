@@ -822,3 +822,173 @@ def test_reprint_missing_field_legacy():
         },
     )
     assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# 机台版面 /api/v1/impose/press-layout
+# ---------------------------------------------------------------------------
+
+PRESS_LAYOUT_BASE = {
+    "total_pages": 4,
+    "max_sheets_per_signature": 1,
+    "binding": "left",
+    "page_width_mm": 210.0,
+    "page_height_mm": 297.0,
+    "gutter_mm": 10.0,
+    "duplex_flip": "long",
+}
+
+
+def test_press_layout_long_flip_paper_and_placements():
+    response = client.post("/api/v1/impose/press-layout", json=PRESS_LAYOUT_BASE)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["paper_width_mm"] == 430.0
+    assert data["paper_height_mm"] == 297.0
+    assert data["duplex_flip"] == "long"
+    assert data["signature_count"] == 1
+    sig = data["signatures"][0]
+    assert sig["paper_width_mm"] == 430.0
+    assert sig["paper_height_mm"] == 297.0
+    sheet = sig["sheets"][0]
+    # 左装订：正面 (4, 1)；左槽 x=0，右槽 x=页宽+中缝
+    assert sheet["front"]["left"] == {
+        "page": 4, "x_mm": 0.0, "y_mm": 0.0, "rotation_deg": 0
+    }
+    assert sheet["front"]["right"] == {
+        "page": 1, "x_mm": 220.0, "y_mm": 0.0, "rotation_deg": 0
+    }
+    # long：背面原 (2, 3) 交换槽位、旋转 0
+    assert sheet["back"]["left"] == {
+        "page": 3, "x_mm": 0.0, "y_mm": 0.0, "rotation_deg": 0
+    }
+    assert sheet["back"]["right"] == {
+        "page": 2, "x_mm": 220.0, "y_mm": 0.0, "rotation_deg": 0
+    }
+
+
+def test_press_layout_short_flip_rotates_back_180():
+    body = {**PRESS_LAYOUT_BASE, "duplex_flip": "short", "gutter_mm": 0}
+    response = client.post("/api/v1/impose/press-layout", json=body)
+    assert response.status_code == 200
+    sheet = response.json()["signatures"][0]["sheets"][0]
+    assert sheet["front"]["left"]["rotation_deg"] == 0
+    assert sheet["front"]["right"] == {
+        "page": 1, "x_mm": 210.0, "y_mm": 0.0, "rotation_deg": 0
+    }
+    # short：槽位保持（背左=2、背右=3），各旋转 180°
+    assert sheet["back"]["left"] == {
+        "page": 2, "x_mm": 0.0, "y_mm": 0.0, "rotation_deg": 180
+    }
+    assert sheet["back"]["right"] == {
+        "page": 3, "x_mm": 210.0, "y_mm": 0.0, "rotation_deg": 180
+    }
+
+
+def test_press_layout_right_binding():
+    body = {**PRESS_LAYOUT_BASE, "binding": "right"}
+    response = client.post("/api/v1/impose/press-layout", json=body)
+    assert response.status_code == 200
+    sheet = response.json()["signatures"][0]["sheets"][0]
+    assert sheet["front"]["left"]["page"] == 1
+    assert sheet["front"]["right"]["page"] == 4
+
+
+def test_press_layout_blank_slots_null():
+    body = {**PRESS_LAYOUT_BASE, "total_pages": 1}
+    response = client.post("/api/v1/impose/press-layout", json=body)
+    assert response.status_code == 200
+    sheet = response.json()["signatures"][0]["sheets"][0]
+    assert sheet["front"]["left"] is None
+    assert sheet["front"]["right"]["page"] == 1
+    assert sheet["back"]["left"] is None
+    assert sheet["back"]["right"] is None
+
+
+def test_press_layout_zero_gutter_allowed():
+    body = {**PRESS_LAYOUT_BASE, "gutter_mm": 0}
+    response = client.post("/api/v1/impose/press-layout", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["paper_width_mm"] == 420.0
+    assert data["signatures"][0]["sheets"][0]["front"]["right"]["x_mm"] == 210.0
+
+
+def test_press_layout_multi_signature():
+    body = {**PRESS_LAYOUT_BASE, "total_pages": 6, "max_sheets_per_signature": 1}
+    response = client.post("/api/v1/impose/press-layout", json=body)
+    assert response.status_code == 200
+    sigs = response.json()["signatures"]
+    assert len(sigs) == 2
+    assert [(s["signature_index"], s["sheet_count"]) for s in sigs] == [(1, 1), (2, 1)]
+    assert sigs[1]["page_count_padded"] == 4
+
+
+def test_press_layout_invalid_page_width_zero():
+    body = {**PRESS_LAYOUT_BASE, "page_width_mm": 0}
+    response = client.post("/api/v1/impose/press-layout", json=body)
+    assert response.status_code == 422
+
+
+def test_press_layout_invalid_page_height_negative():
+    body = {**PRESS_LAYOUT_BASE, "page_height_mm": -1}
+    response = client.post("/api/v1/impose/press-layout", json=body)
+    assert response.status_code == 422
+
+
+def test_press_layout_invalid_gutter_negative():
+    body = {**PRESS_LAYOUT_BASE, "gutter_mm": -0.5}
+    response = client.post("/api/v1/impose/press-layout", json=body)
+    assert response.status_code == 422
+
+
+def test_press_layout_non_finite_dimensions_return_422():
+    # NaN / Infinity 必须返回 422 而不是 500（默认错误回显无法 JSON 序列化）
+    for payload in (
+        '{"total_pages": 4, "max_sheets_per_signature": 1, "binding": "left", '
+        '"page_width_mm": NaN, "page_height_mm": 297, "gutter_mm": 0, '
+        '"duplex_flip": "long"}',
+        '{"total_pages": 4, "max_sheets_per_signature": 1, "binding": "left", '
+        '"page_width_mm": 210, "page_height_mm": Infinity, "gutter_mm": 0, '
+        '"duplex_flip": "long"}',
+        '{"total_pages": 4, "max_sheets_per_signature": 1, "binding": "left", '
+        '"page_width_mm": 210, "page_height_mm": 297, "gutter_mm": -Infinity, '
+        '"duplex_flip": "long"}',
+    ):
+        response = client.post(
+            "/api/v1/impose/press-layout",
+            content=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 422
+
+
+def test_press_layout_invalid_duplex_flip():
+    body = {**PRESS_LAYOUT_BASE, "duplex_flip": "side"}
+    response = client.post("/api/v1/impose/press-layout", json=body)
+    assert response.status_code == 422
+
+
+def test_press_layout_invalid_binding():
+    body = {**PRESS_LAYOUT_BASE, "binding": "top"}
+    response = client.post("/api/v1/impose/press-layout", json=body)
+    assert response.status_code == 422
+
+
+def test_press_layout_invalid_total_pages():
+    body = {**PRESS_LAYOUT_BASE, "total_pages": 0}
+    response = client.post("/api/v1/impose/press-layout", json=body)
+    assert response.status_code == 422
+
+
+def test_press_layout_unknown_field_rejected():
+    body = {**PRESS_LAYOUT_BASE, "extra": 1}
+    response = client.post("/api/v1/impose/press-layout", json=body)
+    assert response.status_code == 422
+
+
+def test_press_layout_missing_field():
+    body = dict(PRESS_LAYOUT_BASE)
+    del body["gutter_mm"]
+    response = client.post("/api/v1/impose/press-layout", json=body)
+    assert response.status_code == 422

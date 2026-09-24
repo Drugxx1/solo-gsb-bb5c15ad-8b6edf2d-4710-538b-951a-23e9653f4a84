@@ -14,6 +14,9 @@
 原样、左右镜像、正反互换或两者组合地读出）与按相同拼版规则生成的预期印张配对，先最大化配对数、
 再最大化已读页位吻合数，并逐张给出帖号/张号、解释变换与已知页位错误明细。
 
+还提供**机台版面**接口 `/api/v1/impose/press-layout`：在上述拼版页序之上给出每张纸的纸面尺寸，
+以及正反面每个页位的页码、左上角坐标与旋转角度（支持双面打印的长边 / 短边翻转），空白页位保留 `null`。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件），在项目根目录执行：
@@ -54,6 +57,7 @@ HOST_PORT=9000 docker compose up -d --build
 - 章节分帖拼版接口：`POST http://localhost:8000/api/v1/impose/chapters`
 - 重印复用接口：`POST http://localhost:8000/api/v1/impose/reprint`
 - 印张抽检接口：`POST http://localhost:8000/api/v1/impose/inspect`
+- 机台版面接口：`POST http://localhost:8000/api/v1/impose/press-layout`
 
 ## 接口说明
 
@@ -130,6 +134,111 @@ curl -X POST http://localhost:8000/api/v1/impose \
   ]
 }
 ```
+
+## 机台版面（POST /api/v1/impose/press-layout）
+
+在 `/api/v1/impose` 的**相同分帖、末帖补空白与左/右装订页序规则**之上，为每个页位补充
+机台落版所需的纸面尺寸、左上角坐标与旋转角度。本地访问地址
+`http://localhost:8000/api/v1/impose/press-layout`（改了 `HOST_PORT` 则对应替换端口）。
+
+### 请求
+
+`POST /api/v1/impose/press-layout`，`Content-Type: application/json`
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `total_pages` | 整数 | ≥ 1 | 总页数（正整数） |
+| `max_sheets_per_signature` | 整数 | ≥ 1 | 每帖最多纸张数；每帖最多容纳其 **4 倍**页数 |
+| `binding` | 字符串 | `left` / `right` | 装订方向：左装订 / 右装订 |
+| `page_width_mm` | 数值 | 正数（有限值） | 单页宽度（mm） |
+| `page_height_mm` | 数值 | 正数（有限值） | 单页高度（mm） |
+| `gutter_mm` | 数值 | 非负数（有限值） | 中缝宽度（mm），允许为 `0` |
+| `duplex_flip` | 字符串 | `long` / `short` | 双面翻转：`long`=长边翻转，`short`=短边翻转 |
+
+```bash
+curl -X POST http://localhost:8000/api/v1/impose/press-layout \
+  -H "Content-Type: application/json" \
+  -d '{
+    "total_pages": 4,
+    "max_sheets_per_signature": 1,
+    "binding": "left",
+    "page_width_mm": 210,
+    "page_height_mm": 297,
+    "gutter_mm": 10,
+    "duplex_flip": "long"
+  }'
+```
+
+### 坐标与翻转规则
+
+- **纸面尺寸**：每张纸的纸面宽 `paper_width_mm = 2 × page_width_mm + gutter_mm`
+  （两倍页宽加中缝），纸面高 `paper_height_mm = page_height_mm`（等于页高）；
+  顶层与每帖都给出纸面尺寸。
+- **坐标系**：以纸张**左上角为原点**，x 轴向右、y 轴向下，单位 mm。
+  - 正面左槽位于 `x = 0`，右槽位于 `x = page_width_mm + gutter_mm`，两槽 `y = 0`；
+  - `x_mm` / `y_mm` 为页位**未旋转时**的左上角坐标。
+- **正反面**：
+  - 正面（`front`）左右槽均为旋转 `0°`；
+  - 背面（`back`）`long`（长边翻转）模式**交换左右槽**（页码随新槽位，坐标按新槽位给出），
+    各页位旋转 `0°`；
+  - 背面（`back`）`short`（短边翻转）模式**保持槽位**（坐标不变），各页位绕**页位中心**
+    旋转 `180°`。页位与槽位等大，0°/180° 旋转都不改变外接框，故左上角坐标与槽位一致。
+- **空白页位**：补齐的空白页位整体为 `null`（不含坐标），规则与 `/api/v1/impose` 相同。
+
+### 响应
+
+按帖号 `signature_index`、张号 `sheet_index`（从 1 开始，1 为最外张）返回；每个页位给出
+`page`（页码）、`x_mm` / `y_mm`（左上角坐标）、`rotation_deg`（绕页位中心的旋转角 `0` 或 `180`）。
+
+上例（4 页、页宽 210、中缝 10，纸面 430 × 297，`long`）响应：
+
+```json
+{
+  "total_pages": 4,
+  "max_sheets_per_signature": 1,
+  "binding": "left",
+  "page_width_mm": 210.0,
+  "page_height_mm": 297.0,
+  "gutter_mm": 10.0,
+  "duplex_flip": "long",
+  "paper_width_mm": 430.0,
+  "paper_height_mm": 297.0,
+  "signature_count": 1,
+  "signatures": [
+    {
+      "signature_index": 1,
+      "sheet_count": 1,
+      "page_count_padded": 4,
+      "paper_width_mm": 430.0,
+      "paper_height_mm": 297.0,
+      "sheets": [
+        {
+          "sheet_index": 1,
+          "front": {
+            "left":  { "page": 4, "x_mm": 0.0,   "y_mm": 0.0, "rotation_deg": 0 },
+            "right": { "page": 1, "x_mm": 220.0, "y_mm": 0.0, "rotation_deg": 0 }
+          },
+          "back": {
+            "left":  { "page": 3, "x_mm": 0.0,   "y_mm": 0.0, "rotation_deg": 0 },
+            "right": { "page": 2, "x_mm": 220.0, "y_mm": 0.0, "rotation_deg": 0 }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+同一请求若改为 `"duplex_flip": "short"`、`"gutter_mm": 0`（纸面 420 × 297），背面将保持
+左装订页序（背左 = 2、背右 = 3），两个页位的 `rotation_deg` 均为 `180`、`x_mm` 分别为
+`0.0` 与 `210.0`。
+
+### 非法参数（4xx）
+
+除与 `/api/v1/impose` 相同的校验（`total_pages` / `max_sheets_per_signature` / `binding`、
+未定义字段等）外，`page_width_mm` / `page_height_mm` 非正数（含 `0`、负数、`NaN`、
+`Infinity`）、`gutter_mm` 为负数或非有限值、`duplex_flip` 不是 `long`/`short` 时，
+均返回 `422 Unprocessable Entity`。
 
 ## 章节分帖拼版（POST /api/v1/impose/chapters）
 

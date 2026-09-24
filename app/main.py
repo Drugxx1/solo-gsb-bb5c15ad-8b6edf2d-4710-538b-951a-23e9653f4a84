@@ -1,13 +1,22 @@
 """离线小册子拼版 API。"""
 from __future__ import annotations
 
+import math
 from typing import Literal, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
-from .imposition import impose, impose_chapters, inspect_observed_sheets, plan_reprint, UNREAD
+from .imposition import (
+    impose,
+    impose_chapters,
+    inspect_observed_sheets,
+    plan_reprint,
+    press_layout,
+    UNREAD,
+)
 
 app = FastAPI(
     title="离线小册子拼版 API",
@@ -19,8 +28,9 @@ app = FastAPI(
         "支持旧版/新版重印复用：四页位完全相同且均未改动的旧印张可整张复用。"
         "支持印张抽检：把乱序实物印张（可原样/左右镜像/正反互换/两者组合解释）"
         "与预期拼版配对并核对已知页位。"
+        "支持机台版面：在拼版结果上给出纸面尺寸与正反面各页位的坐标、旋转角。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -62,6 +72,90 @@ class ImpositionResponse(BaseModel):
     binding: Literal["left", "right"]
     signature_count: int
     signatures: list[Signature]
+
+
+# ---------------------------------------------------------------------------
+# 机台版面 /api/v1/impose/press-layout
+# ---------------------------------------------------------------------------
+
+
+class PressLayoutRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    total_pages: int = Field(
+        ..., ge=1, description="总页数，正整数（1, 2, 3, ...）"
+    )
+    max_sheets_per_signature: int = Field(
+        ..., ge=1, description="每帖最多纸张数，正整数；每帖最多容纳其 4 倍页数"
+    )
+    binding: Literal["left", "right"] = Field(
+        ..., description="装订方向：left=左装订，right=右装订"
+    )
+    page_width_mm: float = Field(..., description="单页宽度（mm），正数")
+    page_height_mm: float = Field(..., description="单页高度（mm），正数")
+    gutter_mm: float = Field(..., description="中缝宽度（mm），非负数")
+    duplex_flip: Literal["long", "short"] = Field(
+        ..., description="双面翻转方式：long=长边翻转，short=短边翻转"
+    )
+
+    @field_validator("page_width_mm", "page_height_mm")
+    @classmethod
+    def validate_positive_mm(cls, value: float) -> float:
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("页宽、页高必须为正数（有限数值，单位 mm）")
+        return value
+
+    @field_validator("gutter_mm")
+    @classmethod
+    def validate_non_negative_mm(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("中缝宽度必须为非负数（有限数值，单位 mm）")
+        return value
+
+
+class PagePlacement(BaseModel):
+    page: int = Field(..., description="页码，从 1 开始")
+    x_mm: float = Field(
+        ..., description="页位（未旋转时）左上角的 x 坐标（mm），以纸张左上角为原点"
+    )
+    y_mm: float = Field(..., description="页位（未旋转时）左上角的 y 坐标（mm），恒为 0")
+    rotation_deg: Literal[0, 180] = Field(
+        ..., description="绕页位中心的旋转角度（度）：正面与 long 背面为 0，short 背面为 180"
+    )
+
+
+class PlacementPair(BaseModel):
+    left: Optional[PagePlacement] = Field(..., description="左槽页位，空白页为 null")
+    right: Optional[PagePlacement] = Field(..., description="右槽页位，空白页为 null")
+
+
+class PressLayoutSheet(BaseModel):
+    sheet_index: int = Field(..., description="帖内纸张序号，从 1 开始（1 为最外张）")
+    front: PlacementPair = Field(..., description="正面左右槽页位")
+    back: PlacementPair = Field(..., description="背面左右槽页位")
+
+
+class PressLayoutSignature(BaseModel):
+    signature_index: int = Field(..., description="帖号，从 1 开始")
+    sheet_count: int = Field(..., description="本帖纸张数")
+    page_count_padded: int = Field(..., description="本帖补齐空白后的总页数（4 的倍数）")
+    paper_width_mm: float = Field(..., description="纸面宽度（mm）= 2 × 页宽 + 中缝")
+    paper_height_mm: float = Field(..., description="纸面高度（mm）= 页高")
+    sheets: list[PressLayoutSheet] = Field(..., description="帖内纸张，按从外到内排列")
+
+
+class PressLayoutResponse(BaseModel):
+    total_pages: int
+    max_sheets_per_signature: int
+    binding: Literal["left", "right"]
+    page_width_mm: float
+    page_height_mm: float
+    gutter_mm: float
+    duplex_flip: Literal["long", "short"]
+    paper_width_mm: float = Field(..., description="纸面宽度（mm）= 2 × 页宽 + 中缝")
+    paper_height_mm: float = Field(..., description="纸面高度（mm）= 页高")
+    signature_count: int
+    signatures: list[PressLayoutSignature]
 
 
 class ChapterImpositionRequest(BaseModel):
@@ -331,6 +425,25 @@ def create_imposition(request: ImpositionRequest) -> ImpositionResponse:
 
 
 @app.post(
+    "/api/v1/impose/press-layout",
+    response_model=PressLayoutResponse,
+    tags=["拼版"],
+    summary="机台版面：纸面尺寸与各页位坐标、旋转角",
+)
+def create_press_layout(request: PressLayoutRequest) -> PressLayoutResponse:
+    layout = press_layout(
+        total_pages=request.total_pages,
+        max_sheets=request.max_sheets_per_signature,
+        binding=request.binding,
+        page_width_mm=request.page_width_mm,
+        page_height_mm=request.page_height_mm,
+        gutter_mm=request.gutter_mm,
+        duplex_flip=request.duplex_flip,
+    )
+    return PressLayoutResponse(**layout)
+
+
+@app.post(
     "/api/v1/impose/chapters",
     response_model=ChapterImpositionResponse,
     tags=["拼版"],
@@ -453,6 +566,34 @@ def inspect_sheets(request: InspectRequest) -> InspectResponse:
         unmatched_observations=unmatched,
         unseen_signatures=result["unseen_signatures"],
     )
+
+
+def _json_safe(value: object) -> object:
+    """把错误明细中的非 JSON 有限浮点（NaN/Infinity）与异常对象替换为可序列化值。
+
+    标准 JSON 不支持 NaN/Infinity：FastAPI 默认 422 响应会回显输入值，
+    若请求体含 ``NaN`` / ``Infinity``，默认渲染会抛 ValueError 并落到 500。
+    """
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0 else "-Infinity"
+        return value
+    if isinstance(value, BaseException):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    _request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    return JSONResponse(status_code=422, content={"detail": _json_safe(exc.errors())})
 
 
 @app.exception_handler(Exception)

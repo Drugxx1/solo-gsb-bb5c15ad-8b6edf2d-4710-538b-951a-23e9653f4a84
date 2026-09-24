@@ -104,6 +104,102 @@ def impose(total_pages: int, max_sheets: int, binding: Binding) -> List[dict]:
     return result
 
 
+# ---------------------------------------------------------------------------
+# 机台版面（press-layout）：拼版结果叠加纸面尺寸、页位坐标与双面翻转
+# ---------------------------------------------------------------------------
+
+DuplexFlip = Literal["long", "short"]
+
+
+def press_layout(
+    total_pages: int,
+    max_sheets: int,
+    binding: Binding,
+    page_width_mm: float,
+    page_height_mm: float,
+    gutter_mm: float,
+    duplex_flip: DuplexFlip,
+) -> dict:
+    """在 :func:`impose` 的拼版结果上补充纸面尺寸与各页位坐标、旋转角。
+
+    沿用总页数 / 每帖最大张数 / 装订方向的分帖与正反面页序规则。纸面宽为
+    ``2 × 页宽 + 中缝``，纸面高为页高。坐标以纸张左上角为原点：左槽 x=0、
+    右槽 x=页宽+中缝，所有槽位 y=0。正面旋转角恒为 0；背面
+
+    - ``long``（长边翻转）：交换左右槽（页位坐标随新槽位）、旋转 0°；
+    - ``short``（短边翻转）：保持槽位、各页位绕自身中心旋转 180°。
+
+    空白页位整体返回 ``None``。非法翻转模式抛 ``ValueError``。
+    """
+    if duplex_flip not in ("long", "short"):
+        raise ValueError(
+            f"非法双面翻转模式：{duplex_flip!r}，只支持 'long' / 'short'"
+        )
+
+    paper_width = 2 * page_width_mm + gutter_mm
+    paper_height = page_height_mm
+    right_slot_x = page_width_mm + gutter_mm
+    back_rotation = 0 if duplex_flip == "long" else 180
+
+    def placement(page: Optional[P], x: float, rotation: int) -> Optional[dict]:
+        # x/y 为页位（未旋转时）左上角；旋转绕页位中心，0°/180° 不改变外接框
+        if page is None:
+            return None
+        return {
+            "page": page,
+            "x_mm": x,
+            "y_mm": 0.0,
+            "rotation_deg": rotation,
+        }
+
+    result_signatures: List[dict] = []
+    for signature in impose(total_pages, max_sheets, binding):
+        layout_sheets: List[dict] = []
+        for sheet in signature["sheets"]:
+            back_left = sheet["back"]["left"]
+            back_right = sheet["back"]["right"]
+            if duplex_flip == "long":
+                # 长边翻转：背面左右槽交换
+                back_left, back_right = back_right, back_left
+            layout_sheets.append(
+                {
+                    "sheet_index": sheet["sheet_index"],
+                    "front": {
+                        "left": placement(sheet["front"]["left"], 0.0, 0),
+                        "right": placement(sheet["front"]["right"], right_slot_x, 0),
+                    },
+                    "back": {
+                        "left": placement(back_left, 0.0, back_rotation),
+                        "right": placement(back_right, right_slot_x, back_rotation),
+                    },
+                }
+            )
+        result_signatures.append(
+            {
+                "signature_index": signature["signature_index"],
+                "sheet_count": signature["sheet_count"],
+                "page_count_padded": signature["page_count_padded"],
+                "paper_width_mm": paper_width,
+                "paper_height_mm": paper_height,
+                "sheets": layout_sheets,
+            }
+        )
+
+    return {
+        "total_pages": total_pages,
+        "max_sheets_per_signature": max_sheets,
+        "binding": binding,
+        "page_width_mm": page_width_mm,
+        "page_height_mm": page_height_mm,
+        "gutter_mm": gutter_mm,
+        "duplex_flip": duplex_flip,
+        "paper_width_mm": paper_width,
+        "paper_height_mm": paper_height,
+        "signature_count": len(result_signatures),
+        "signatures": result_signatures,
+    }
+
+
 def split_signatures_by_chapters(
     total_pages: int,
     max_sheets: int,
